@@ -1,0 +1,57 @@
+/* ---------- misc small additions ---------- */
+.chip-sky { background: var(--sky-soft); color: #1b5f86; }
+.stats.three { grid-template-columns: repeat(3, 1fr); }
+
+/* ---------- Home: total profit ---------- */
+.profit { background: linear-gradient(135deg, #fff, var(--leaf-soft)); }
+.year-pick { display: flex; align-items: center; gap: 8px; font-weight: 800; }
+.year-pick select { width: auto; padding: 6px 10px; }
+.profit-top { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+.profit-amount { font: 800 2.6rem "Baloo 2", sans-serif; line-height: 1; color: var(--leaf); }
+.profit-amount.loss, .pe-res.loss b { color: var(--tomato-d); }
+.profit-top small { color: var(--muted); font-weight: 700; }
+.profit-eq { display: flex; align-items: stretch; gap: 8px; flex-wrap: wrap; }
+.profit-eq i { align-self: center; font: 800 1.5rem "Baloo 2", sans-serif; color: var(--muted); font-style: normal; }
+.pe { flex: 1 1 150px; border-radius: 14px; padding: 10px 14px; display: grid; gap: 2px; border: 2px solid var(--line); background: #fff; }
+.pe span { font-size: .82rem; font-weight: 700; color: var(--muted); }
+.pe b { font: 800 1.3rem "Baloo 2", sans-serif; }
+.pe-in { background: var(--sky-soft); border-color: #bfe0f3; }
+.pe-out { background: var(--rose-soft); border-color: #f5c3c7; }
+.pe-res { background: var(--leaf-soft); border-color: var(--leaf); }
+.pe-res b { color: #1d6b47; }
+
+/* ---------- Stock: category filter + edit ---------- */
+.stock-head { flex-wrap: wrap; }
+.stock-tools { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.cat-filter { width: auto; min-width: 150px; }
+.row-actions { white-space: nowrap; }
+.row-actions .btn + .btn { margin-left: 6px; }
+.row-editing { background: var(--sun-soft); }
+label.check { display: flex; align-items: center; gap: 8px; font-weight: 700; }
+label.check input { width: auto; }
+.form-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* ---------- Returns ---------- */
+.ret-switch { justify-content: flex-start; margin: 0; }
+.ret-lines { display: grid; gap: 8px; }
+.ret-line {
+  text-align: left; display: grid; gap: 2px; padding: 10px 12px; border-radius: 12px; cursor: pointer;
+  border: 2px solid var(--line); background: #fff; font: 600 1rem "Nunito", sans-serif; color: var(--ink);
+}
+.ret-line small { color: var(--muted); font-weight: 600; }
+.ret-line.on { border-color: var(--ink); background: var(--sun-soft); box-shadow: 0 3px 0 var(--ink); }
+.ret-line:disabled { opacity: .5; cursor: not-allowed; }
+.ret-outcome > div:first-child span { font-weight: 700; }
+.ret-reason { margin: 2px 0 6px; font-weight: 700; color: #8a5a00; }
+
+/* ---------- Recent 50: returns ---------- */
+.tx-return { border-left-color: var(--tomato); }
+.tx-return .tx-icon { background: var(--rose-soft); }
+
+@media (max-width: 900px) { .stats.three { grid-template-columns: 1fr; } }
+
+/* ---------- new customer / supplier panel ---------- */
+.party-row { display: flex; gap: 8px; align-items: flex-end; }
+.party-row label { flex: 1; min-width: 0; }
+.party-row .btn { white-space: nowrap; }
+.new-party { border: 2px dashed var(--ink); border-radius: 14px; padding: 12px; display: grid; gap: 10px; background: #FFFDF5; }
