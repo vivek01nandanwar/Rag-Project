@@ -7,7 +7,7 @@ by `run_group`. The AI model never touches the database directly.
 """
 import json
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
@@ -17,12 +17,13 @@ from rapidfuzz import fuzz, process
 
 from store import services
 from store.models import (
-    Category, Customer, Item, Payment, Purchase, Sale, SaleItem, Supplier, ZERO,
+    Category, Customer, Item, Payment, Purchase, PurchaseItem, Sale, SaleItem, Supplier, ZERO,
 )
 
 from store import reports
 
 from . import vector
+from .helpers import HelperError, convert_qty, fmt_date, normalize_unit, parse_date
 from .models import CustomField, CustomRecord, CustomTable
 
 MAX_ACTIONS = 8
@@ -65,7 +66,7 @@ def _clip(s, n):
     return str(s or "").strip()[:n]
 
 
-def _json(obj, limit=3200):
+def _json(obj, limit=4500):
     text = json.dumps(obj, default=str, ensure_ascii=False)
     return text if len(text) <= limit else text[:limit] + '..."(truncated)'
 
@@ -80,8 +81,10 @@ def _item_names(it):
 
 def item_dict(it):
     return {
-        "id": it.id, "name": it.name, "unit": it.unit, "selling_price": it.selling_price, "cost_price": it.cost_price,
-        "stock": it.current_stock, "low_stock": it.is_low_stock, "aliases": it.aliases,
+        "id": it.id, "name": it.name, "unit": it.unit,
+        "selling_price": f"{inr(it.selling_price)} per {it.unit}",
+        "buying_price": f"{inr(it.cost_price)} per {it.unit}",
+        "stock": f"{qtys(it.current_stock)} {it.unit}", "low_stock": it.is_low_stock, "aliases": it.aliases,
         "category": it.category.name if it.category else "", "active": it.is_active,
     }
 
@@ -98,6 +101,8 @@ class Ctx:
         self.new_items = {}     # norm name -> dict   (products proposed in this same turn)
         self.new_parties = {}   # (kind, norm name) -> dict
         self.stock_delta = {}   # "id:ITM-1" / "new:name" -> Decimal change inside this turn
+        self.virtual = {}       # bill id -> {"returned": Decimal, "paid": Decimal} proposed in this turn (so a return + refund work together)
+        self.line_returned = {} # bill line id -> quantity already proposed for return in this turn
 
     def add(self, tool, args, summary, danger=False):
         if len(self.proposals) >= MAX_ACTIONS:
@@ -352,6 +357,96 @@ def r_list_custom_records(ctx, a):
     return {"register": t.name, "rows": rows[: a.limit], "total_matching": len(rows)}
 
 
+# ------------------------------------------------------------------ prices, orders, dates
+def _today():
+    return timezone.localdate()
+
+
+def _conv(q, from_unit, to_unit):
+    try:
+        return convert_qty(q, from_unit, to_unit)
+    except HelperError as e:
+        raise ToolFail(str(e))
+
+
+def _date(raw, *, not_before=None, what="date", for_entry=True):
+    try:
+        return parse_date(raw, _today(), not_before=not_before, what=what, for_entry=for_entry)
+    except HelperError as e:
+        raise ToolFail(str(e))
+
+
+def _to_date(iso):
+    return datetime.strptime(iso, "%Y-%m-%d").date() if iso else None
+
+
+def _bill_balance(ctx, bill, is_sale):
+    """(still to pay, extra to give back) for a bill, INCLUDING changes already proposed in this same turn."""
+    v = ctx.virtual.get(bill.id, {"returned": ZERO, "paid": ZERO})
+    paid = (bill.amount_received if is_sale else bill.amount_paid) + v["paid"]
+    diff = (bill.total_amount - bill.returned_amount - v["returned"]) - paid
+    return max(diff, ZERO), max(-diff, ZERO)
+
+
+def r_price_quote(ctx, a):
+    """Exact price for any quantity, in any unit. The arithmetic is done here, never by the AI."""
+    k, it = resolve_item(ctx, a.item, include_inactive=True, allow_new=False)
+    given = D(a.quantity) if a.quantity > 0 else Decimal("1")
+    q = _conv(given, a.unit, it.unit) if a.unit.strip() else given
+    sell = (q * it.selling_price).quantize(Decimal("0.01"))
+    buy = (q * it.cost_price).quantize(Decimal("0.01"))
+    return {
+        "product": it.name, "id": it.id, "unit": it.unit,
+        "selling_price": f"{inr(it.selling_price)} per {it.unit}",
+        "buying_price": f"{inr(it.cost_price)} per {it.unit}",
+        "asked_for": f"{qtys(given)} {a.unit.strip() or it.unit}", "same_as": f"{qtys(q)} {it.unit}",
+        "selling_total": sell, "buying_total": buy, "profit_on_this_quantity": sell - buy,
+        "in_stock": f"{qtys(it.current_stock)} {it.unit}",
+    }
+
+
+def r_find_bills(ctx, a):
+    """Look up real orders (sales or purchases) so the owner can be asked which one."""
+    is_sale = a.kind == "sale"
+    Model, party_kind = (Sale, "customer") if is_sale else (Purchase, "supplier")
+    qs = Model.objects.select_related(party_kind).prefetch_related("lines__item")
+    if a.party.strip():
+        _k, p = resolve_party(ctx, party_kind, a.party, allow_new=False)
+        qs = qs.filter(**{party_kind: p})
+    if a.item.strip():
+        _k, it = resolve_item(ctx, a.item, include_inactive=True, allow_new=False)
+        qs = qs.filter(lines__item=it).distinct()
+    if a.date.strip():
+        qs = qs.filter(date=_date(a.date, what="order date", for_entry=False))
+    if a.date_from.strip():
+        qs = qs.filter(date__gte=_date(a.date_from, what="from date", for_entry=False))
+    if a.date_to.strip():
+        qs = qs.filter(date__lte=_date(a.date_to, what="to date", for_entry=False))
+
+    orders = []
+    for b in qs.order_by("-date", "-created_at")[:40]:
+        items = [{
+            "line_id": l.id, "item": l.item.name, "quantity": l.quantity, "unit": l.item.unit,
+            "price": l.price if is_sale else l.cost_price, "already_returned": l.returned_quantity,
+            "can_return": l.quantity - l.returned_quantity,
+        } for l in b.lines.all()]
+        if a.only_returnable and not any(i["can_return"] > 0 for i in items):
+            continue
+        party = getattr(b, party_kind)
+        orders.append({
+            "bill_id": b.id, "date": b.date, "party": party.name if party else ("Walk-in" if is_sale else "No supplier"),
+            "total": b.total_amount, "returned_so_far": b.returned_amount,
+            "paid": b.amount_received if is_sale else b.amount_paid,
+            "still_pending": b.pending_from_customer if is_sale else b.pending_to_supplier,
+            "refund_due": b.refund_due_to_customer if is_sale else b.refund_due_from_supplier,
+            "items": items,
+        })
+        if len(orders) >= a.limit:
+            break
+    return {"orders": orders, "count": len(orders),
+            "note": "If more than one order fits, list each (id, date, items, total) for the owner and ask which. Never guess."}
+
+
 # ================================================================== WRITE: prepare (validate + summarise + queue)
 # ---------------------------------------------------------------- products
 def prep_create_item(ctx, a):
@@ -531,15 +626,28 @@ def _prep_lines(ctx, lines, *, selling):
     out, text, total = [], [], ZERO
     for ln in lines:
         kind, it = resolve_item(ctx, ln.item)
-        q = D(ln.quantity)
-        if q <= 0:
-            raise ToolFail("Quantity must be more than 0.")
         name = it.name if kind == "id" else it["name"]
         unit = it.unit if kind == "id" else it["unit"]
-        default = (it.selling_price if selling else it.cost_price) if kind == "id" else (it["selling_price"] if selling else it["cost_price"])
-        if ln.price < 0:
+        given = D(ln.quantity)
+        if given <= 0:
+            raise ToolFail("Quantity must be more than 0.")
+        if ln.price < 0 or ln.total < 0:
             raise ToolFail("Price cannot be negative.")
-        price = D(ln.price) if ln.price > 0 else default
+        if ln.unit.strip() and normalize_unit(ln.unit) != unit:       # e.g. 500 g of a kg product
+            q = _conv(given, ln.unit, unit)
+            shown = f"{qtys(q)} {unit} (= {qtys(given)} {ln.unit.strip()})"
+        else:
+            q = given.quantize(Decimal("0.001"))
+            if q <= 0:
+                raise ToolFail("That quantity is too small to record (smallest is 0.001).")
+            shown = f"{qtys(q)} {unit}"
+        default = (it.selling_price if selling else it.cost_price) if kind == "id" else (it["selling_price"] if selling else it["cost_price"])
+        if ln.total > 0:                       # the owner gave the money for the whole line: "500 g for ₹60"
+            price = (D(ln.total) / q).quantize(Decimal("0.01"))
+        elif ln.price > 0:
+            price = D(ln.price)
+        else:
+            price = default
         if selling:
             avail = _available(ctx, kind, it)
             if q > avail:
@@ -551,7 +659,7 @@ def _prep_lines(ctx, lines, *, selling):
         line_total = (q * price).quantize(Decimal("0.01"))
         total += line_total
         out.append({"item": _ref(kind, it), "quantity": str(q), "price": str(price)})
-        text.append(f"{qtys(q)} {unit} {name} × {inr(price)} = {inr(line_total)}")
+        text.append(f"{shown} {name} × {inr(price)}/{unit} = {inr(line_total)}")
     return out, text, total
 
 
@@ -560,6 +668,7 @@ def prep_record_sale(ctx, a):
     if a.customer.strip():
         k, c = resolve_party(ctx, "customer", a.customer)
         cust_ref, cust_name = _ref(k, c), (c.name if k == "id" else c["name"])
+    d = _date(a.date, what="sale date")
     lines, text, total = _prep_lines(ctx, a.lines, selling=True)
     received = total if a.amount_received < 0 else D(a.amount_received)
     pending, refund = max(total - received, ZERO), max(received - total, ZERO)
@@ -569,17 +678,18 @@ def prep_record_sale(ctx, a):
     if mode not in ("cash", "upi", "udhaar"):
         mode = "udhaar" if received == 0 else "cash"
     tail = f" · received {inr(received)}" + (f" · PENDING {inr(pending)}" if pending else "") + (f" · RETURN {inr(refund)} to customer" if refund else "")
-    ctx.add("record_sale", {"customer": cust_ref, "lines": lines, "amount_received": str(received), "payment_mode": mode},
-            f"🧾 Sale to {cust_name}:\n  • " + "\n  • ".join(text) + f"\n  Total {inr(total)}{tail}")
+    ctx.add("record_sale", {"customer": cust_ref, "lines": lines, "amount_received": str(received),
+                            "payment_mode": mode, "date": d.isoformat()},
+            f"🧾 Sale to {cust_name} · 📅 {fmt_date(d, _today())}:\n  • " + "\n  • ".join(text) + f"\n  Total {inr(total)}{tail}")
 
 
 def run_record_sale(args, user):
     customer = _load_party("customer", args["customer"]) if args.get("customer") else None
     lines = [{"item": _load_item(l["item"]), "quantity": l["quantity"], "price": l["price"]} for l in args["lines"]]
     s = services.create_sale(customer=customer, lines=lines, amount_received=D(args["amount_received"]),
-                             payment_mode=args["payment_mode"], notes="via assistant")
+                             payment_mode=args["payment_mode"], notes="via assistant", date=_to_date(args.get("date")))
     extra = f", pending {inr(s.pending_from_customer)}" if s.pending_from_customer else ""
-    return f"Sale {s.id} saved · total {inr(s.total_amount)}{extra}"
+    return f"Sale {s.id} saved ({s.date:%d %b %Y}) · total {inr(s.total_amount)}{extra}"
 
 
 def prep_record_purchase(ctx, a):
@@ -587,6 +697,7 @@ def prep_record_purchase(ctx, a):
     if a.supplier.strip():
         k, s = resolve_party(ctx, "supplier", a.supplier)
         sup_ref, sup_name = _ref(k, s), (s.name if k == "id" else s["name"])
+    d = _date(a.date, what="purchase date")
     lines, text, total = _prep_lines(ctx, a.lines, selling=False)
     paid = total if a.amount_paid < 0 else D(a.amount_paid)
     pending, refund = max(total - paid, ZERO), max(paid - total, ZERO)
@@ -594,16 +705,17 @@ def prep_record_purchase(ctx, a):
         raise ToolFail("Unpaid or extra-paid amounts need a supplier. Ask the owner who the supplier is.")
     tail = f" · paid {inr(paid)}" + (f" · STILL TO PAY {inr(pending)}" if pending else "") + (f" · supplier must RETURN {inr(refund)}" if refund else "")
     ctx.add("record_purchase", {"supplier": sup_ref, "lines": [{"item": l["item"], "quantity": l["quantity"], "cost_price": l["price"]} for l in lines],
-                                "amount_paid": str(paid)},
-            f"🚚 Purchase from {sup_name}:\n  • " + "\n  • ".join(text) + f"\n  Total {inr(total)}{tail}")
+                                "amount_paid": str(paid), "date": d.isoformat()},
+            f"🚚 Purchase from {sup_name} · 📅 {fmt_date(d, _today())}:\n  • " + "\n  • ".join(text) + f"\n  Total {inr(total)}{tail}")
 
 
 def run_record_purchase(args, user):
     supplier = _load_party("supplier", args["supplier"]) if args.get("supplier") else None
     lines = [{"item": _load_item(l["item"]), "quantity": l["quantity"], "cost_price": l["cost_price"]} for l in args["lines"]]
-    p = services.create_purchase(supplier=supplier, lines=lines, amount_paid=D(args["amount_paid"]), notes="via assistant")
+    p = services.create_purchase(supplier=supplier, lines=lines, amount_paid=D(args["amount_paid"]),
+                                 notes="via assistant", date=_to_date(args.get("date")))
     extra = f", still to pay {inr(p.pending_to_supplier)}" if p.pending_to_supplier else ""
-    return f"Purchase {p.id} saved · total {inr(p.total_amount)}{extra}"
+    return f"Purchase {p.id} saved ({p.date:%d %b %Y}) · total {inr(p.total_amount)}{extra}"
 
 
 SETTLE = {  # action: (party kind, bill model, outstanding field, payment direction, verb)
@@ -612,33 +724,58 @@ SETTLE = {  # action: (party kind, bill model, outstanding field, payment direct
     "pay_supplier": ("supplier", Purchase, "pending_to_supplier", "out", "Pay {a} to {p}"),
     "receive_refund": ("supplier", Purchase, "refund_due_from_supplier", "in", "Get back {a} from {p}"),
 }
+_PENDING_ACTIONS = {"receive_payment", "pay_supplier"}   # these reduce a *pending* balance; the other two a *refund* balance
 
 
-def _open_bills(action, party):
+def _open_bills(action, party, bill_id=""):
     kind, Model, field, _d, _v = SETTLE[action]
-    return Model.objects.filter(**{kind: party, f"{field}__gt": 0}).order_by("date", "created_at")
+    qs = Model.objects.filter(**{kind: party, f"{field}__gt": 0}).order_by("date", "created_at")
+    return qs.filter(pk=bill_id) if bill_id else qs
+
+
+def _outstanding(ctx, action, bill):
+    pending, refund = _bill_balance(ctx, bill, SETTLE[action][0] == "customer")
+    return pending if action in _PENDING_ACTIONS else refund
 
 
 def prep_settle_dues(ctx, a):
     kind, Model, field, direction, verb = SETTLE[a.action]
-    k, p = resolve_party(ctx, kind, a.party, allow_new=False)
+    _k, p = resolve_party(ctx, kind, a.party, allow_new=False)
     amount = D(a.amount)
     if amount <= 0:
         raise ToolFail("Amount must be more than 0.")
-    outstanding = sum((getattr(b, field) for b in _open_bills(a.action, p)), ZERO)
+    bill_id = a.bill.strip().upper()
+    bills = list(Model.objects.filter(**{kind: p}).order_by("date", "created_at"))
+    if bill_id:
+        bills = [b for b in bills if b.id == bill_id]
+        if not bills:
+            raise ToolFail(f"Bill {bill_id} does not belong to {p.name}.")
+    # balances include a return proposed earlier in this same turn (so "return + money received" works together)
+    rows = [(b, _outstanding(ctx, a.action, b)) for b in bills]
+    rows = [(b, o) for b, o in rows if o > 0]
+    outstanding = sum((o for _b, o in rows), ZERO)
     if outstanding <= 0:
-        raise ToolFail(f"{p.name} has nothing pending for this.")
+        raise ToolFail(f"{p.name} has nothing pending for this" + (f" on {bill_id}" if bill_id else "")
+                       + ". (If the bill still had unpaid money, a return only reduces that unpaid amount, so no cash moves.)")
     if amount > outstanding:
         raise ToolFail(f"{p.name} only has {inr(outstanding)} pending for this, not {inr(amount)}.")
-    ctx.add("settle_dues", {"action": a.action, "party": f"id:{p.id}", "amount": str(amount)},
-            f"💰 {verb.format(a=inr(amount), p=p.name)}  (pending {inr(outstanding)} → {inr(outstanding - amount)})")
+    left, grows = amount, a.action in _PENDING_ACTIONS
+    for b, o in rows:                                   # remember it, so a second settlement in this turn sees the new balance
+        if left <= 0:
+            break
+        part = min(left, o)
+        ctx.virtual.setdefault(b.id, {"returned": ZERO, "paid": ZERO})["paid"] += part if grows else -part
+        left -= part
+    ctx.add("settle_dues", {"action": a.action, "party": f"id:{p.id}", "amount": str(amount), "bill": bill_id},
+            f"💰 {verb.format(a=inr(amount), p=p.name)}" + (f" (bill {bill_id})" if bill_id else "")
+            + f"  · pending {inr(outstanding)} → {inr(outstanding - amount)}")
 
 
 def run_settle_dues(args, user):
     kind, Model, field, direction, verb = SETTLE[args["action"]]
     p = _load_party(kind, args["party"])
     left = D(args["amount"])
-    for bill in list(_open_bills(args["action"], p)):
+    for bill in list(_open_bills(args["action"], p, args.get("bill", ""))):
         if left <= 0:
             break
         part = min(left, getattr(bill, field))
@@ -650,6 +787,110 @@ def run_settle_dues(args, user):
     if left > 0:
         raise ToolFail("The pending amount changed while you were confirming. Please ask again.")
     return verb.format(a=inr(D(args["amount"])), p=p.name) + " ✔"
+
+
+# ---------------------------------------------------------------- returns (purchase -> supplier, sale -> customer)
+def _pick_line(ctx, bill, item_ref):
+    _k, it = resolve_item(ctx, item_ref, include_inactive=True, allow_new=False)
+    lines = [l for l in bill.lines.select_related("item") if l.item_id == it.id]
+    if not lines:
+        on_bill = ", ".join(f"{l.item.name} {qtys(l.quantity)} {l.item.unit}" for l in bill.lines.select_related("item"))
+        raise ToolFail(f"{it.name} is not on bill {bill.id}. That bill has: {on_bill}.")
+    for l in lines:
+        left = l.quantity - l.returned_quantity - ctx.line_returned.get(l.id, ZERO)
+        if left > 0:
+            return l, it, left
+    raise ToolFail(f"All the {it.name} on bill {bill.id} has already been returned.")
+
+
+def _return_common(ctx, a, *, is_sale):
+    Model = Sale if is_sale else Purchase
+    bill = (Model.objects.select_related("customer" if is_sale else "supplier")
+            .filter(pk=str(a.bill).strip().upper()).first())
+    if bill is None:
+        raise ToolFail(f"There is no bill with id '{a.bill}'. Use find_bills to find the order and confirm it with the owner.")
+    line, it, left = _pick_line(ctx, bill, a.item)
+    given = D(a.quantity)
+    if given <= 0:
+        raise ToolFail("Return quantity must be more than 0.")
+    if a.unit.strip() and normalize_unit(a.unit) != it.unit:
+        q = _conv(given, a.unit, it.unit)
+    else:
+        q = given.quantize(Decimal("0.001"))
+        if q <= 0:
+            raise ToolFail("That quantity is too small to record (smallest is 0.001).")
+    if q > left:
+        raise ToolFail(f"Only {qtys(left)} {it.unit} of {it.name} can still be returned from {bill.id} (the bill had {qtys(line.quantity)} {it.unit}).")
+    d = _date(a.date, not_before=bill.date, what="return date")
+    return bill, line, it, q, given, d
+
+
+def _after_text(pending, refund, is_sale):
+    parts = []
+    if pending:
+        parts.append(f"{'customer' if is_sale else 'shop'} still owes {inr(pending)}")
+    if refund:
+        parts.append(f"{'shop must give back' if is_sale else 'supplier must give back'} {inr(refund)}")
+    return " · ".join(parts) if parts else "bill fully settled"
+
+
+def prep_record_purchase_return(ctx, a):
+    reason = _clip(a.reason, 200)
+    if len(reason) < 3:
+        raise ToolFail("A purchase return needs a reason (for example: damaged, expired, wrong item). Ask the owner.")
+    bill, line, it, q, given, d = _return_common(ctx, a, is_sale=False)
+    stock = it.current_stock + ctx.stock_delta.get("id:" + it.id, ZERO)
+    if q > stock:
+        raise ToolFail(f"Only {qtys(stock)} {it.unit} of {it.name} is in stock now, so {qtys(q)} cannot be sent back. Check the stock count first.")
+    amount = (q * line.cost_price).quantize(Decimal("0.01"))
+    _bump_stock(ctx, "id", it, -q)
+    ctx.line_returned[line.id] = ctx.line_returned.get(line.id, ZERO) + q
+    ctx.virtual.setdefault(bill.id, {"returned": ZERO, "paid": ZERO})["returned"] += amount
+    pending, refund = _bill_balance(ctx, bill, False)
+    who = bill.supplier.name if bill.supplier else "no supplier"
+    shown = f"{qtys(q)} {it.unit}" + (f" (= {qtys(given)} {a.unit.strip()})" if a.unit.strip() and normalize_unit(a.unit) != it.unit else "")
+    ctx.add("record_purchase_return",
+            {"purchase_item": line.id, "quantity": str(q), "reason": reason, "date": d.isoformat()},
+            f"↩️ Purchase return to {who} · bill {bill.id} ({bill.date:%d %b %Y}, total {inr(bill.total_amount)}):\n"
+            f"  • {shown} {it.name} × {inr(line.cost_price)}/{it.unit} = {inr(amount)} · reason: {reason}\n"
+            f"  📅 Return date: {fmt_date(d, _today())} · stock goes down by {qtys(q)} {it.unit}\n"
+            f"  After this: {_after_text(pending, refund, False)}")
+
+
+def run_record_purchase_return(args, user):
+    try:
+        line = PurchaseItem.objects.get(pk=args["purchase_item"])
+    except PurchaseItem.DoesNotExist:
+        raise ToolFail("That purchase line no longer exists.")
+    r = services.create_purchase_return(purchase_item=line, quantity=D(args["quantity"]), reason=args["reason"],
+                                        date=_to_date(args.get("date")))
+    return f"Purchase return {r.id} saved: {qtys(r.quantity)} {r.item.unit} {r.item.name} sent back ({inr(r.amount)})"
+
+
+def prep_record_sale_return(ctx, a):
+    bill, line, it, q, given, d = _return_common(ctx, a, is_sale=True)
+    amount = (q * line.price).quantize(Decimal("0.01"))
+    _bump_stock(ctx, "id", it, q)
+    ctx.line_returned[line.id] = ctx.line_returned.get(line.id, ZERO) + q
+    ctx.virtual.setdefault(bill.id, {"returned": ZERO, "paid": ZERO})["returned"] += amount
+    pending, refund = _bill_balance(ctx, bill, True)
+    who = bill.customer.name if bill.customer else "Walk-in customer"
+    shown = f"{qtys(q)} {it.unit}" + (f" (= {qtys(given)} {a.unit.strip()})" if a.unit.strip() and normalize_unit(a.unit) != it.unit else "")
+    ctx.add("record_sale_return",
+            {"sale_item": line.id, "quantity": str(q), "date": d.isoformat()},
+            f"↩️ Sales return from {who} · bill {bill.id} ({bill.date:%d %b %Y}, total {inr(bill.total_amount)}):\n"
+            f"  • {shown} {it.name} × {inr(line.price)}/{it.unit} = {inr(amount)}\n"
+            f"  📅 Return date: {fmt_date(d, _today())} · stock goes up by {qtys(q)} {it.unit}\n"
+            f"  After this: {_after_text(pending, refund, True)}")
+
+
+def run_record_sale_return(args, user):
+    try:
+        line = SaleItem.objects.get(pk=args["sale_item"])
+    except SaleItem.DoesNotExist:
+        raise ToolFail("That sale line no longer exists.")
+    r = services.create_sale_return(sale_item=line, quantity=D(args["quantity"]), date=_to_date(args.get("date")))
+    return f"Sales return {r.id} saved: {qtys(r.quantity)} {r.item.unit} {r.item.name} taken back ({inr(r.amount)})"
 
 
 def prep_adjust_stock(ctx, a):
@@ -866,6 +1107,8 @@ WRITE_OPS = {
     "record_sale": (prep_record_sale, run_record_sale),
     "record_purchase": (prep_record_purchase, run_record_purchase),
     "settle_dues": (prep_settle_dues, run_settle_dues),
+    "record_purchase_return": (prep_record_purchase_return, run_record_purchase_return),
+    "record_sale_return": (prep_record_sale_return, run_record_sale_return),
     "adjust_stock": (prep_adjust_stock, run_adjust_stock),
     "create_custom_table": (prep_create_custom_table, run_create_custom_table),
     "add_custom_field": (prep_add_custom_field, run_add_custom_field),

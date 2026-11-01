@@ -48,8 +48,12 @@ class ListCustomRecordsArgs(BaseModel):
 # ----------------------------------------------------------------- shop write tools (all need owner confirmation)
 class LineIn(BaseModel):
     item: str = Field(description="Product name, nickname or id (ITM-0001).")
-    quantity: float = Field(description="Quantity in the product's own unit.")
-    price: float = Field(0, description="Price per unit. 0 = use the product's saved price.")
+    quantity: float = Field(description="Quantity exactly as the owner said it, in the unit given in 'unit'.")
+    unit: str = Field("", description="Unit of 'quantity' when it differs from the product's own unit, e.g. 'g' for a kg product. "
+                                      "Empty = the product's own unit. The system converts it.")
+    price: float = Field(0, description="Price per ONE of the product's OWN unit (per kg for a kg product). 0 = use the saved price.")
+    total: float = Field(0, description="If the owner stated the money for this whole line (e.g. '500 g for 60 rupees') put it here "
+                                        "instead of price. 0 = not given.")
 
 
 class CreateItemArgs(BaseModel):
@@ -106,12 +110,14 @@ class RecordSaleArgs(BaseModel):
     lines: list[LineIn]
     amount_received: float = Field(-1, description="Money received now. -1 = the full bill was paid. 0 = nothing paid (udhaar).")
     payment_mode: str = Field("", description="'cash', 'upi' or 'udhaar'. Empty = decide automatically.")
+    date: str = Field("", description="Sale date YYYY-MM-DD. Empty = today.")
 
 
 class RecordPurchaseArgs(BaseModel):
     supplier: str = Field("", description="Supplier name/id. Needed when part of the bill is unpaid.")
     lines: list[LineIn] = Field(description="'price' here is the BUYING price per unit (0 = saved buying price).")
     amount_paid: float = Field(-1, description="Money paid now. -1 = the full bill was paid. 0 = nothing paid.")
+    date: str = Field("", description="Purchase date YYYY-MM-DD. Empty = today.")
 
 
 class SettleDuesArgs(BaseModel):
@@ -120,6 +126,7 @@ class SettleDuesArgs(BaseModel):
                     "pay_supplier: shop pays a supplier's pending bill. receive_refund: supplier returns extra money.")
     party: str = Field(description="Customer or supplier name/id (customer for the first two actions, supplier for the last two).")
     amount: float
+    bill: str = Field("", description="Optional bill id (SAL-0001 / PUR-0001) to settle only that bill, e.g. right after a return on it.")
 
 
 class AdjustStockArgs(BaseModel):
@@ -168,3 +175,38 @@ class UpdateCustomRecordArgs(BaseModel):
 
 class DeleteCustomRecordArgs(BaseModel):
     record_id: str
+
+
+# ----------------------------------------------------------------- prices, orders and returns
+class PriceQuoteArgs(BaseModel):
+    item: str = Field(description="Product name, nickname or id.")
+    quantity: float = Field(1, description="How much the owner asks about.")
+    unit: str = Field("", description="Unit of that quantity (g, kg, ml, litre, piece, dozen, packet). Empty = the product's own unit.")
+
+
+class FindBillsArgs(BaseModel):
+    kind: Literal["sale", "purchase"]
+    party: str = Field("", description="Customer (sale) or supplier (purchase) name/id. Empty = anyone.")
+    item: str = Field("", description="Only orders that contain this product. Empty = any.")
+    date: str = Field("", description="Exact order date YYYY-MM-DD. Empty = any.")
+    date_from: str = Field("", description="Orders on or after this date YYYY-MM-DD.")
+    date_to: str = Field("", description="Orders on or before this date YYYY-MM-DD.")
+    only_returnable: bool = Field(False, description="True = only orders that still have something that can be returned.")
+    limit: int = Field(5, ge=1, le=8)
+
+
+class RecordPurchaseReturnArgs(BaseModel):
+    bill: str = Field(description="The purchase bill id (PUR-0001) that the goods came from. Get it from find_bills and confirm it with the owner.")
+    item: str = Field(description="Product being sent back.")
+    quantity: float = Field(description="Quantity as the owner said it.")
+    unit: str = Field("", description="Unit of the quantity if not the product's own unit. Empty = product's unit.")
+    reason: str = Field(description="Why it is sent back (damaged, expired, wrong item...). Required.")
+    date: str = Field("", description="Return date YYYY-MM-DD. Empty = today.")
+
+
+class RecordSaleReturnArgs(BaseModel):
+    bill: str = Field(description="The sale bill id (SAL-0001) the customer bought from. Get it from find_bills and confirm it with the owner.")
+    item: str = Field(description="Product the customer brings back.")
+    quantity: float = Field(description="Quantity as the owner said it.")
+    unit: str = Field("", description="Unit of the quantity if not the product's own unit. Empty = product's unit.")
+    date: str = Field("", description="Return date YYYY-MM-DD. Empty = today.")

@@ -20,6 +20,12 @@ READ = {
     "recent_transactions": (schemas.RecentArgs, ops.r_recent, "Latest sales and purchases."),
     "sales_summary": (schemas.SalesSummaryArgs, ops.r_sales_summary,
                       "Sales total, received money, estimated profit and top 5 items for the last N days."),
+    "price_quote": (schemas.PriceQuoteArgs, ops.r_price_quote,
+                    "Exact selling and buying price of a product for ANY quantity/unit (e.g. 500 g of a kg product), with the profit. "
+                    "Use it for every price or cost question; never calculate prices yourself."),
+    "find_bills": (schemas.FindBillsArgs, ops.r_find_bills,
+                   "Find real sales or purchases by party, product and/or date. Returns bill ids, dates, items with quantities and "
+                   "how much of each can still be returned, totals and pending money. Use before any return."),
     "search_documents": (schemas.SearchDocsArgs, ops.r_search_documents,
                          "Search inside the long files (PDF/Excel/Word/photos) the owner uploaded in THIS chat."),
     "list_custom_tables": (schemas.NoArgs, ops.r_list_custom_tables,
@@ -39,6 +45,8 @@ WRITE = {
     "record_purchase": (schemas.RecordPurchaseArgs, "Propose a purchase from a supplier. Increases stock and updates buying price."),
     "settle_dues": (schemas.SettleDuesArgs, "Propose receiving/paying/refunding pending money for a customer or supplier."),
     "adjust_stock": (schemas.AdjustStockArgs, "Propose correcting a product's stock to the counted quantity."),
+    "record_purchase_return": (schemas.RecordPurchaseReturnArgs, "Propose sending goods back to a supplier for ONE bill line. Needs the bill id, product, quantity and a reason. Stock goes down."),
+    "record_sale_return": (schemas.RecordSaleReturnArgs, "Propose a customer returning goods from ONE sale bill. Stock goes up. No reason is stored."),
     "create_custom_table": (schemas.CreateCustomTableArgs, "Propose a NEW extra register (e.g. Employees) with fields."),
     "add_custom_field": (schemas.AddCustomFieldArgs, "Propose adding one field to an existing extra register."),
     "delete_custom_table": (schemas.DeleteCustomTableArgs, "Propose deleting an extra register and its records."),
@@ -49,9 +57,9 @@ WRITE = {
 
 TOOLSETS = {
     "shop": ["search_items", "list_low_stock", "find_party", "business_summary", "list_pending", "recent_transactions",
-             "sales_summary", "search_documents", "list_custom_tables",
+             "sales_summary", "search_documents", "list_custom_tables", "price_quote", "find_bills",
              "create_item", "update_item", "delete_item", "create_party", "update_party", "delete_party",
-             "record_sale", "record_purchase", "settle_dues", "adjust_stock"],
+             "record_sale", "record_purchase", "record_sale_return", "record_purchase_return", "settle_dues", "adjust_stock"],
     "custom": ["list_custom_tables", "list_custom_records", "search_items", "find_party", "business_summary",
                "create_custom_table", "add_custom_field", "delete_custom_table",
                "add_custom_record", "update_custom_record", "delete_custom_record"],

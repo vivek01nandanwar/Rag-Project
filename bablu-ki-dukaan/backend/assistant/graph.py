@@ -27,6 +27,10 @@ SECRETS = re.compile(
     r"(api[\s_-]?key|secret[\s_-]?key|system\s+prompt|your\s+instructions|ignore\s+(all\s+|any\s+|the\s+)?(previous|above|prior)\s+(instructions|rules)|"
     r"show\s+.{0,20}password|\.env\b|reveal\s+.{0,20}(prompt|key))", re.I)
 
+SHOP_HINT = re.compile(
+    r"(price|rate|bhav|bhaav|kimat|keemat|kitne|kitna|cost|profit|stock|baaki|baki|udhaar|udhar|bikri|becha|bechi|khareed|kharid|"
+    r"purchase|sale|sold|bought|return|wapas|bill|order|supplier|customer|ledger|₹|rs\.?\s*\d|\bkg\b|\bgram|\bgm\b|litre|packet|dozen)", re.I)
+
 REFUSE_DESTRUCTIVE = ("🙅 I can't wipe or bulk-delete shop data - it would destroy your bills, stock and udhaar records.\n\n"
                       "Safe alternatives: delete ONE unused product/customer, hide a product, recount stock, "
                       "or tell me exactly which record is wrong and I'll suggest a correction.")
@@ -106,8 +110,8 @@ def build_graph(ctx):
         except Exception as e:
             log.warning("router failed, defaulting to shop: %s", e)
             intent = "shop"
-        if intent == "chat" and state.get("attachments"):
-            intent = "shop"
+        if intent == "chat" and (state.get("attachments") or SHOP_HINT.search(text)):
+            intent = "shop"   # never treat a price / stock / bill question as small talk
         return {"intent": intent}
 
     def n_chat(state):
@@ -147,7 +151,7 @@ def build_graph(ctx):
                 except Exception as e:
                     log.warning("tool %s crashed: %s", call["name"], e)
                     content = f"ERROR: invalid arguments ({str(e)[:200]})."
-            out.append(ToolMessage(content=content[:3500], tool_call_id=call["id"], name=call["name"]))
+            out.append(ToolMessage(content=content[:4800], tool_call_id=call["id"], name=call["name"]))
         return {"messages": out}
 
     def n_finalize(state):

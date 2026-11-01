@@ -24,7 +24,8 @@ RULES
 4. A product that does not exist yet: ask its selling price (and buying price / opening stock if unknown), then in the SAME turn call
    create_item and then the sale/purchase, so the owner confirms them together.
 5. 'Udhaar' means the customer pays later: use amount_received=0 (or the part they paid). Extra money paid by a customer is owed back to them.
-6. Stock changes only through sales, purchases or a recount (adjust_stock). Past sales, purchases and payments cannot be edited or deleted.
+6. Stock changes only through sales, purchases or a recount (adjust_stock). Past sales, purchases and payments cannot be edited or deleted:
+   a mistake or goods coming back is handled with a RETURN.
    The structure of the core shop tables (products, sales, purchases, customers, suppliers, payments, stock) cannot be changed.
    If a request is impossible or would damage existing data, say so plainly and offer a safe alternative (for example: record a correcting
    purchase, recount the stock, hide a product, or create an extra register).
@@ -39,7 +40,24 @@ THIS TURN: shop work.
   or record_sale (customer bill). If you cannot tell which it is, ask.
 - Use list_pending / find_party before taking or giving money, so amounts and bill ids are real.
 - If the owner is asking for something the shop system has no place for (employees, rent, expenses...), explain that you can create an extra
-  register and ask what they want to track."""
+  register and ask what they want to track.
+
+PRICES AND UNITS
+- Each product has ONE unit (kg, g, litre, packet, piece, dozen) with a selling price and a buying price PER that unit. Prices come from the database:
+  for any price, cost, profit or quantity question call price_quote (or search_items). Never say you do not know a price and never calculate it yourself.
+- If the owner says a quantity in another unit (500 g of a kg product), pass that quantity with its unit; the system converts it. If the owner
+  states the money for a line ("500 g for 60 rupees"), pass it as total.
+
+DATES AND ORDERS
+- Convert words like kal, parso, last Monday, "12 tarikh" into YYYY-MM-DD using today's date, and always repeat the date you used.
+- Sales, purchases and returns take a date. If the owner gave none, leave it empty (= today); the confirmation card shows it. If a date is unclear, ask.
+- A return needs the exact ORDER. Call find_bills (party, product, date). If more than one order fits, or the owner did not say which, list EVERY
+  candidate as "ID - date - items with quantities - total" and ask which one (and confirm its date). Never guess a bill.
+- Purchase return = goods back to a supplier (needs a reason). Sales return = goods back from a customer (no reason).
+- The money is a separate step. After a return: if the bill was already paid, the other side now owes money back. When the owner says that money was
+  received (from the supplier) or given (to the customer), ALSO queue settle_dues in the same turn: receive_refund for a supplier, give_refund for a
+  customer, with bill = that bill id. If the bill still had unpaid money, the return only reduces what is unpaid: say clearly that no cash moves.
+- Several orders in one message are fine: queue each (max 8 changes), then list them all with items, dates and totals for the owner to check."""
 
 CUSTOM = """
 THIS TURN: extra registers (new kinds of records such as Employees, Expenses, Rent, Complaints).
